@@ -12,6 +12,7 @@ import Foundation
 class OTSessionManager: RCTEventEmitter {
     
     var connectCallback: RCTResponseSenderBlock?
+    var disconnectCallback: RCTResponseSenderBlock?
     var jsEvents: [String] = [];
     var componentEvents: [String] = [];
     var logLevel: Bool = false;
@@ -22,7 +23,8 @@ class OTSessionManager: RCTEventEmitter {
         OTRN.sharedState.isPublishing.removeAll();
         OTRN.sharedState.publishers.removeAll();
         OTRN.sharedState.subscribers.removeAll();
-        
+        OTRN.sharedState.publisherDestroyedCallbacks.removeAll();
+        OTRN.sharedState.connections.removeAll();
     }
     
     override static func requiresMainQueueSetup() -> Bool {
@@ -34,8 +36,10 @@ class OTSessionManager: RCTEventEmitter {
         return allEvents + jsEvents
     }
     
-    @objc func initSession(_ apiKey: String, sessionId: String) -> Void {
-        OTRN.sharedState.session = OTSession(apiKey: apiKey, sessionId: sessionId, delegate: self)
+    @objc func initSession(_ apiKey: String, sessionId: String, sessionOptions: Dictionary<String, Any>) -> Void {
+        let settings = OTSessionSettings()
+        settings.connectionEventsSuppressed = Utils.sanitizeBooleanProperty(sessionOptions["connectionEventsSuppressed"] as Any);
+        OTRN.sharedState.session = OTSession(apiKey: apiKey, sessionId: sessionId, delegate: self, settings: settings)
     }
     
     @objc func connect(_ token: String, callback: @escaping RCTResponseSenderBlock) -> Void {
@@ -61,12 +65,14 @@ class OTSessionManager: RCTEventEmitter {
             publisherProperties.name = properties["name"] as? String;
             OTRN.sharedState.publishers.updateValue(OTPublisher(delegate: self, settings: publisherProperties)!, forKey: publisherId);
             guard let publisher = OTRN.sharedState.publishers[publisherId] else {
-                callback(["Error creating publisher"]);
+                let errorInfo = EventUtils.createErrorMessage("There was an error creating the native publisher instance")
+                callback([errorInfo]);
                 return
             }
             if let videoSource = properties["videoSource"] as? String, videoSource == "screen" {
                 guard let screenView = RCTPresentedViewController()?.view else {
-                    callback(["Error setting screenshare"]);
+                    let errorInfo = EventUtils.createErrorMessage("There was an error setting the videoSource as screen")
+                    callback([errorInfo]);
                     return
                 }
                 publisher.videoType = .screen;
@@ -85,7 +91,8 @@ class OTSessionManager: RCTEventEmitter {
     @objc func publish(_ publisherId: String, callback: RCTResponseSenderBlock) -> Void {
         var error: OTError?
         guard let publisher = OTRN.sharedState.publishers[publisherId] else {
-            callback(["Error getting publisher"]);
+            let errorInfo = EventUtils.createErrorMessage("Error publishing. Could not find native publisher instance")
+            callback([errorInfo]);
             return
         }
         OTRN.sharedState.session?.publish(publisher, error: &error)
@@ -100,11 +107,13 @@ class OTSessionManager: RCTEventEmitter {
         var error: OTError?
         DispatchQueue.main.async {
             guard let stream = OTRN.sharedState.subscriberStreams[streamId] else {
-                callback(["Error getting stream while subscribing"]);
+                let errorInfo = EventUtils.createErrorMessage("Error subscribing. Could not find native stream for subscriber.")
+                callback([errorInfo]);
                 return
             }
             guard let subscriber = OTSubscriber(stream: stream, delegate: self) else {
-                callback(["Error creating subscriber"]);
+                let errorInfo = EventUtils.createErrorMessage("Error subscribing. Could not create subscriber.")
+                callback([errorInfo]);
                 return
             }
             OTRN.sharedState.subscribers.updateValue(subscriber, forKey: streamId)
@@ -125,27 +134,25 @@ class OTSessionManager: RCTEventEmitter {
         DispatchQueue.main.async {
             OTRN.sharedState.streamObservers.removeValue(forKey: streamId);
             guard let subscriber = OTRN.sharedState.subscribers[streamId] else {
-                callback(["There was an error finding the subscriber"])
+                self.removeStream(streamId)
+                callback([NSNull()])
                 return
             }
             subscriber.view?.removeFromSuperview();
             subscriber.delegate = nil;
-            OTRN.sharedState.subscribers[streamId] = nil;
-            OTRN.sharedState.subscriberStreams[streamId] = nil;
+            self.removeStream(streamId)
             callback([NSNull()])
         }
         
     }
     
-    @objc func disconnectSession(_ callback: RCTResponseSenderBlock) -> Void {
+    @objc func disconnectSession(_ callback: @escaping RCTResponseSenderBlock) -> Void {
         var error: OTError?
         OTRN.sharedState.session?.disconnect(&error)
         if let err = error {
             dispatchErrorViaCallback(callback, error: err)
         } else {
-            OTRN.sharedState.session?.delegate = nil;
-            OTRN.sharedState.session = nil;
-            callback([NSNull()])
+            disconnectCallback = callback;
         }
     }
     
@@ -197,9 +204,14 @@ class OTSessionManager: RCTEventEmitter {
     }
     
     @objc func sendSignal(_ signal: Dictionary<String, String>, callback: RCTResponseSenderBlock ) -> Void {
-        let connection: OTConnection? = nil
         var error: OTError?
-        OTRN.sharedState.session?.signal(withType: signal["type"], string: signal["data"], connection: connection, error: &error)
+        if let connectionId = signal["to"] {
+            let connection = OTRN.sharedState.connections[connectionId]
+            OTRN.sharedState.session?.signal(withType: signal["type"], string: signal["data"], connection: connection, error: &error)
+        } else {
+            let connection: OTConnection? = nil
+            OTRN.sharedState.session?.signal(withType: signal["type"], string: signal["data"], connection: connection, error: &error)
+        }
         if let err = error {
             dispatchErrorViaCallback(callback, error: err)
         } else {
@@ -211,19 +223,20 @@ class OTSessionManager: RCTEventEmitter {
         DispatchQueue.main.async {
             guard let publisher = OTRN.sharedState.publishers[publisherId] else { callback([NSNull()]); return }
             guard let session = OTRN.sharedState.session else {
-                self.resetPublisher(publisherId, publisher: publisher);
                 callback([NSNull()]);
                 return
             }
             var error: OTError?
             if let isPublishing = OTRN.sharedState.isPublishing[publisherId] {
-                if (isPublishing) {
+                if (isPublishing && session.sessionConnectionStatus.rawValue == 1) {
                     session.unpublish(publisher, error: &error)
                 }
             }
-            self.resetPublisher(publisherId, publisher: publisher);
-            guard let err = error else { callback([NSNull()]); return }
-            callback([err.localizedDescription as Any])
+            guard let err = error else {
+                OTRN.sharedState.publisherDestroyedCallbacks[publisherId] = callback;
+                return
+            }
+            self.dispatchErrorViaCallback(callback, error: err)
         }
     }
     
@@ -248,8 +261,12 @@ class OTSessionManager: RCTEventEmitter {
     
     func resetPublisher(_ publisherId: String, publisher: OTPublisher) -> Void {
         publisher.view?.removeFromSuperview()
-        publisher.delegate = nil;
         OTRN.sharedState.isPublishing[publisherId] = false;
+    }
+    
+    func removeStream(_ streamId: String) -> Void {
+        OTRN.sharedState.subscribers.removeValue(forKey: streamId)
+        OTRN.sharedState.subscriberStreams.removeValue(forKey: streamId)
     }
     
     func emitEvent(_ event: String, data: Any) -> Void {
@@ -289,15 +306,21 @@ extension OTSessionManager: OTSessionDelegate {
     func sessionDidDisconnect(_ session: OTSession) {
         let sessionInfo = EventUtils.prepareJSSessionEventData(session);
         self.emitEvent("\(EventUtils.sessionPreface)sessionDidDisconnect", data: sessionInfo);
+        guard let callback = disconnectCallback else { return }
+        callback([NSNull()]);
+        OTRN.sharedState.session?.delegate = nil;
+        OTRN.sharedState.session = nil;
         printLogs("OTRN: Session disconnected")
     }
     
     func session(_ session: OTSession, connectionCreated connection: OTConnection) {
+        OTRN.sharedState.connections.updateValue(connection, forKey: connection.connectionId)
         let connectionInfo = EventUtils.prepareJSConnectionEventData(connection);
         self.emitEvent("\(EventUtils.sessionPreface)connectionCreated", data: connectionInfo)
         printLogs("OTRN Session: A connection was created \(connection.connectionId)")
     }
     func session(_ session: OTSession, connectionDestroyed connection: OTConnection) {
+        OTRN.sharedState.connections.removeValue(forKey: connection.connectionId)
         let connectionInfo = EventUtils.prepareJSConnectionEventData(connection);
         self.emitEvent("\(EventUtils.sessionPreface)connectionDestroyed", data: connectionInfo)
         printLogs("OTRN Session: A connection was destroyed")
@@ -392,11 +415,19 @@ extension OTSessionManager: OTPublisherDelegate {
     
     func publisher(_ publisher: OTPublisherKit, streamDestroyed stream: OTStream) {
         let publisherId = Utils.getPublisherId(publisher as! OTPublisher);
+        OTRN.sharedState.isPublishing[publisherId] = false;
         if (publisherId.count > 0) {
             OTRN.sharedState.isPublishing[publisherId] = false;
             let streamInfo: Dictionary<String, Any> = EventUtils.prepareJSStreamEventData(stream);
             self.emitEvent("\(publisherId):\(EventUtils.publisherPreface)streamDestroyed", data: streamInfo);
         }
+        OTRN.sharedState.publishers[publisherId] = nil;
+        OTRN.sharedState.isPublishing[publisherId] = nil;
+        guard let callback = OTRN.sharedState.publisherDestroyedCallbacks[publisherId] else {
+            printLogs("OTRN: Publisher Stream destroyed")
+            return
+        };
+        callback([NSNull()]);
         printLogs("OTRN: Publisher Stream destroyed")
     }
     
@@ -431,119 +462,95 @@ extension OTSessionManager: OTSubscriberDelegate {
     }
     
     func subscriber(_ subscriber: OTSubscriberKit, didFailWithError error: OTError) {
-        let streamId = Utils.getStreamIdBySubscriber(subscriber as! OTSubscriber);
         var subscriberInfo: Dictionary<String, Any> = [:];
-        if (streamId.count > 0) {
-            subscriberInfo["error"] = EventUtils.prepareJSErrorEventData(error);
-            guard let stream = OTRN.sharedState.subscriberStreams[streamId] else {
-                self.emitEvent("\(EventUtils.subscriberPreface)didFailWithError", data: subscriberInfo)
-                return
-            }
-            subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        subscriberInfo["error"] = EventUtils.prepareJSErrorEventData(error);
+        guard let stream = subscriber.stream else {
             self.emitEvent("\(EventUtils.subscriberPreface)didFailWithError", data: subscriberInfo)
+            return;
         }
+        subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        self.emitEvent("\(EventUtils.subscriberPreface)didFailWithError", data: subscriberInfo)
         printLogs("OTRN: Subscriber failed: \(error.localizedDescription)")
     }
 }
 
 extension OTSessionManager: OTSubscriberKitNetworkStatsDelegate {
     func subscriber(_ subscriber: OTSubscriberKit, videoNetworkStatsUpdated stats: OTSubscriberKitVideoNetworkStats) {
-        let streamId = Utils.getStreamIdBySubscriber(subscriber as! OTSubscriber);
         var subscriberInfo: Dictionary<String, Any> = [:];
-        if (streamId.count > 0) {
-            subscriberInfo["videoStats"] = EventUtils.prepareSubscriberVideoNetworkStatsEventData(stats);
-            guard let stream = OTRN.sharedState.subscriberStreams[streamId] else {
-                self.emitEvent("\(EventUtils.subscriberPreface)videoNetworkStatsUpdated", data: subscriberInfo);
-                return
-            }
-            subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        subscriberInfo["videoStats"] = EventUtils.prepareSubscriberVideoNetworkStatsEventData(stats);
+        guard let stream = subscriber.stream else {
             self.emitEvent("\(EventUtils.subscriberPreface)videoNetworkStatsUpdated", data: subscriberInfo);
+            return;
         }
+        subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        self.emitEvent("\(EventUtils.subscriberPreface)videoNetworkStatsUpdated", data: subscriberInfo);
     }
     
     func subscriber(_ subscriber: OTSubscriberKit, audioNetworkStatsUpdated stats: OTSubscriberKitAudioNetworkStats) {
-        let streamId = Utils.getStreamIdBySubscriber(subscriber as! OTSubscriber);
         var subscriberInfo: Dictionary<String, Any> = [:];
-        if (streamId.count > 0) {
-            subscriberInfo["audioStats"] = EventUtils.prepareSubscriberAudioNetworkStatsEventData(stats);
-            guard let stream = OTRN.sharedState.subscriberStreams[streamId] else {
-                self.emitEvent("\(EventUtils.subscriberPreface)audioNetworkStatsUpdated", data: subscriberInfo);
-                return
-            }
-            subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        subscriberInfo["audioStats"] = EventUtils.prepareSubscriberAudioNetworkStatsEventData(stats);
+        guard let stream = subscriber.stream else {
             self.emitEvent("\(EventUtils.subscriberPreface)audioNetworkStatsUpdated", data: subscriberInfo);
+            return
         }
+        subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        self.emitEvent("\(EventUtils.subscriberPreface)audioNetworkStatsUpdated", data: subscriberInfo);
     }
     
     func subscriberVideoEnabled(_ subscriber: OTSubscriberKit, reason: OTSubscriberVideoEventReason) {
-        let streamId = Utils.getStreamIdBySubscriber(subscriber as! OTSubscriber);
         var subscriberInfo: Dictionary<String, Any> = [:];
-        if (streamId.count > 0) {
-            subscriberInfo["reason"] = Utils.convertOTSubscriberVideoEventReasonToString(reason);
-            guard let stream = OTRN.sharedState.subscriberStreams[streamId] else {
-                self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoEnabled", data: subscriberInfo);
-                return
-            }
-            subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        subscriberInfo["reason"] = Utils.convertOTSubscriberVideoEventReasonToString(reason);
+        guard let stream = subscriber.stream else {
             self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoEnabled", data: subscriberInfo);
+            return;
         }
+        subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoEnabled", data: subscriberInfo);
         printLogs("OTRN: subscriberVideoEnabled")
     }
     
     func subscriberVideoDisabled(_ subscriber: OTSubscriberKit, reason: OTSubscriberVideoEventReason) {
-        let streamId = Utils.getStreamIdBySubscriber(subscriber as! OTSubscriber);
         var subscriberInfo: Dictionary<String, Any> = [:];
-        if (streamId.count > 0) {
-            subscriberInfo["reason"] = Utils.convertOTSubscriberVideoEventReasonToString(reason);
-            guard let stream = OTRN.sharedState.subscriberStreams[streamId] else {
-                self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDisabled", data: subscriberInfo);
-                return
-            }
-            subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        subscriberInfo["reason"] = Utils.convertOTSubscriberVideoEventReasonToString(reason);
+        guard let stream = subscriber.stream else {
             self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDisabled", data: subscriberInfo);
+            return;
         }
+        subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDisabled", data: subscriberInfo);
         printLogs("OTRN: subscriberVideoDisabled")
     }
     
     func subscriberVideoDisableWarning(_ subscriber: OTSubscriberKit) {
-        let streamId = Utils.getStreamIdBySubscriber(subscriber as! OTSubscriber);
         var subscriberInfo: Dictionary<String, Any> = [:];
-        if (streamId.count > 0) {
-            guard let stream = OTRN.sharedState.subscriberStreams[streamId] else {
-                self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDisableWarning", data: subscriberInfo);
-                return
-            }
-            subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        guard let stream = subscriber.stream else {
             self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDisableWarning", data: subscriberInfo);
+            return;
         }
+        subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDisableWarning", data: subscriberInfo);
         printLogs("OTRN: subscriberVideoDisableWarning")
     }
     
     func subscriberVideoDisableWarningLifted(_ subscriber: OTSubscriberKit) {
-        let streamId = Utils.getStreamIdBySubscriber(subscriber as! OTSubscriber);
         var subscriberInfo: Dictionary<String, Any> = [:];
-        if (streamId.count > 0) {
-            guard let stream = OTRN.sharedState.subscriberStreams[streamId] else {
-                self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDisableWarningLifted", data: subscriberInfo);
-                return
-            }
-            subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        guard let stream = subscriber.stream else {
             self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDisableWarningLifted", data: subscriberInfo);
+            return;
         }
+        subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDisableWarningLifted", data: subscriberInfo);
         printLogs("OTRN: subscriberVideoDisableWarningLifted")
     }
     
     func subscriberVideoDataReceived(_ subscriber: OTSubscriber) {
-        let streamId = Utils.getStreamIdBySubscriber(subscriber);
         var subscriberInfo: Dictionary<String, Any> = [:];
-        if (streamId.count > 0) {
-            guard let stream = OTRN.sharedState.subscriberStreams[streamId] else {
-                self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDataReceived", data: subscriberInfo);
-                return
-            }
-            subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        guard let stream = subscriber.stream else {
             self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDataReceived", data: subscriberInfo);
+            return
         }
+        subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        self.emitEvent("\(EventUtils.subscriberPreface)subscriberVideoDataReceived", data: subscriberInfo);
     }
     
     func subscriberDidReconnect(toStream subscriber: OTSubscriberKit) {
@@ -574,17 +581,13 @@ extension OTSessionManager: OTSubscriberKitNetworkStatsDelegate {
 
 extension OTSessionManager: OTSubscriberKitAudioLevelDelegate {
     func subscriber(_ subscriber: OTSubscriberKit, audioLevelUpdated audioLevel: Float) {
-        let streamId = Utils.getStreamIdBySubscriber(subscriber as! OTSubscriber);
         var subscriberInfo: Dictionary<String, Any> = [:];
-        if (streamId.count > 0) {
-            subscriberInfo["audioLevel"] = audioLevel;
-            guard let stream = OTRN.sharedState.subscriberStreams[streamId] else {
-                self.emitEvent("\(EventUtils.subscriberPreface)audioLevelUpdated", data: subscriberInfo);
-                return
-            }
-            var subscriberInfo: Dictionary<String, Any> = [:];
-            subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        subscriberInfo["audioLevel"] = audioLevel;
+        guard let stream = subscriber.stream else {
             self.emitEvent("\(EventUtils.subscriberPreface)audioLevelUpdated", data: subscriberInfo);
+            return;
         }
+        subscriberInfo["stream"] = EventUtils.prepareJSStreamEventData(stream);
+        self.emitEvent("\(EventUtils.subscriberPreface)audioLevelUpdated", data: subscriberInfo);
     }
 }
